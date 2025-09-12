@@ -1,3 +1,6 @@
+import time
+import random
+from requests.exceptions import RequestException
 import streamlit as st
 import requests
 import json
@@ -23,17 +26,30 @@ if 'fastest_jeet' not in st.session_state:
 # DexScreener API base URL
 BASE_URL = "https://api.dexscreener.com/latest/dex"
 
-@st.cache_data(ttl=60)  # Cache for 1 min to respect rate limits
-def fetch_recent_pairs(chain="solana", query="meme"):  # Focus on Solana meme coins
+@st.cache_data(ttl=60)  # Cache for 1 minute to reduce API calls
+def fetch_recent_pairs(chain="solana", query="meme"):
     url = f"{BASE_URL}/search/?q={query}&chainId={chain}"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        return data.get('pairs', [])[:10]  # Limit to recent pairs
-    except Exception as e:
-        st.error(f"API error: {e}")
-        return []
+    max_retries = 3
+    retry_delay = 1  # Initial delay in seconds
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()  # Raise exception for 4xx/5xx errors
+            data = response.json()
+            return data.get('pairs', [])[:10]  # Limit to 10 recent pairs
+        except RequestException as e:
+            if response.status_code == 429:
+                wait_time = retry_delay * (2 ** attempt) + random.uniform(0, 1)  # Exponential backoff with jitter
+                st.warning(f"Rate limit hit. Retrying in {wait_time:.1f} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                if attempt == max_retries - 1:
+                    st.error(f"API error: Too Many Requests. Max retries reached. Try again later or reduce scan frequency.")
+                    return []
+            else:
+                st.error(f"API error: {e}. Check connection or API status.")
+                return []
+    return []
 
 def estimate_price_at_time(pair, timestamp):
     # Mock historical price estimation (in real: use RPC or Coingecko API)
@@ -106,7 +122,18 @@ def main():
                 update_stats(jeets)
                 time.sleep(0.2)  # Rate limit
             st.success(f"Scanned {len(pairs)} pairs. Found {len(jeets)} new jeets!")
-
+if 'last_scan' not in st.session_state:
+    st.session_state.last_scan = 0
+if st.button("🔄 Refresh & Scan") and time.time() - st.session_state.last_scan > 60:  # 60s cooldown
+    pairs = fetch_recent_pairs(chain=chain)
+    for pair in pairs:
+        jeets = detect_jeets_in_pair(pair)
+        update_stats(jeets)
+        time.sleep(0.2)  # Respect rate limit between pairs
+    st.success(f"Scanned {len(pairs)} pairs. Found {len(jeets)} new jeets!")
+    st.session_state.last_scan = time.time()
+elif st.button("🔄 Refresh & Scan"):
+    st.warning("Please wait 60 seconds before scanning again.")
     # Metrics Cards (mimic screenshot style)
     col1, col2, col3, col4 = st.columns(4)
     with col1:
