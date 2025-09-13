@@ -1,86 +1,122 @@
 import streamlit as st
-import plotly.express as px
 import requests
-import time
-from datetime import datetime
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import pandas as pd
+from datetime import datetime, timedelta
+import time
 
-# Initialize session state for caching and key counter
-if "cached_data" not in st.session_state:
-    st.session_state.cached_data = []
-if "counter" not in st.session_state:
-    st.session_state.counter = 0
+# Page config
+st.set_page_config(page_title="Jeet Tracker", page_icon="🚀", layout="wide")
 
-# Function to fetch transaction data from DexScreener API
-def fetch_jeet_data():
-    session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429])
-    session.mount("https://", HTTPAdapter(max_retries=retries))
+st.title("🚨 Jeet Tracker: Track Premature Crypto Sellers!")
+st.markdown("""
+This app tracks potential 'jeets'—traders who exit early and miss gains. 
+We monitor price dips in top cryptos and simulate wallet sells. 
+Data from CoinGecko API. Input a Solana wallet to check for jeet behavior.
+""")
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes to avoid rate limits
+def fetch_crypto_data():
+    """Fetch top 10 cryptos from CoinGecko and detect potential jeet signals (recent dips)."""
     try:
-        # Replace with your DexScreener API endpoint or token pair URL
-        url = "https://api.dexscreener.com/latest/dex/pairs/ethereum/0x123..."  # Example URL
-        response = session.get(url, timeout=5)
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true"
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
-        # Process data to extract transactions (adjust based on API response structure)
-        transactions = data.get("pairs", [])  # Example: list of transactions
-        # Simulate jeet detection (e.g., filter trades with negative profit)
-        jeets = [
-            {
-                "timestamp": tx.get("timestamp", datetime.now().isoformat()),
-                "wallet": tx.get("maker", "Unknown"),
-                "loss": tx.get("profit", 0) * -1 if tx.get("profit", 0) < 0 else 0
-            }
-            for tx in transactions
-        ]
-        return jeets
-    except requests.exceptions.RequestException as e:
-        st.warning(f"API error: {e}. Using cached data.")
-        return st.session_state.cached_data
-
-# App title and sidebar
-st.title("Jeet Tracker")
-st.sidebar.header("Controls")
-refresh = st.sidebar.button("Refresh Data", key="sidebar_refresh_btn")
-
-# Main content with dynamic updates
-placeholder = st.empty()
-with placeholder.container():
-    # Generate unique key suffix
-    timestamp = datetime.now().strftime("%H%M%S%f")
-    st.session_state.counter += 1
-    counter = st.session_state.counter
-
-    # Fetch data
-    data = fetch_jeet_data()
-    if data:
-        st.session_state.cached_data = data
-    else:
-        data = st.session_state.cached_data
-
-    # Display metrics
-    st.write(f"Total Jeet Transactions: {len(data)}", key=f"count_{counter}_{timestamp}")
-    
-    # Display data table
-    if data:
-        df = pd.DataFrame(data)
-        st.dataframe(df, key=f"table_{counter}_{timestamp}")
         
-        # Plotly chart for losses over time
-        fig = px.line(
-            df,
-            x="timestamp",
-            y="loss",
-            title="Jeet Losses Over Time",
-            labels={"timestamp": "Time", "loss": "Loss (USD)"}
-        )
-        st.plotly_chart(fig, key=f"chart_{counter}_{timestamp}")
-    else:
-        st.write("No data available.", key=f"nodata_{counter}_{timestamp}")
+        # Convert to DataFrame
+        df_data = []
+        for coin, info in data.items():
+            change_24h = info.get('usd_24h_change', 0)
+            is_jeet_risk = change_24h < -5  # Simple rule: >5% dip might indicate jeets
+            df_data.append({
+                'Coin': coin.title(),
+                'Price (USD)': info.get('usd', 0),
+                '24h Change (%)': round(change_24h, 2),
+                'Jeet Risk': 'High 🚨' if is_jeet_risk else 'Low ✅'
+            })
+        
+        df = pd.DataFrame(df_data)
+        return df if not df.empty else pd.DataFrame()  # Fallback to empty DF
+    except (requests.RequestException, ValueError, KeyError) as e:
+        st.error(f"API fetch failed: {e}. Using mock data.")
+        # Mock data fallback
+        mock_df = pd.DataFrame({
+            'Coin': ['Bitcoin', 'Ethereum', 'Solana'],
+            'Price (USD)': [60000, 3000, 150],
+            '24h Change (%)': [-3.2, -7.5, -2.1],
+            'Jeet Risk': ['Low ✅', 'High 🚨', 'Low ✅']
+        })
+        return mock_df
 
-# Auto-refresh every 10 seconds (adjust to avoid 429 errors)
-if not refresh:  # Only auto-refresh if manual refresh not clicked
-    time.sleep(10)
-    st.rerun()
+def simulate_wallet_jeets(wallet_address):
+    """Simulate jeet detection for a wallet (replace with real Solana RPC for production)."""
+    # Mock simulation: Generate fake transactions
+    transactions = []
+    if wallet_address:
+        # Simulate 5 recent txs
+        for i in range(5):
+            tx_time = datetime.now() - timedelta(hours=i*2)
+            is_sell = i % 2 == 0  # Alternate buy/sell
+            profit = -10 if is_sell else 5  # Negative for early sells
+            is_jeet = profit < -5  # Detected jeet if sold at loss/dip
+            transactions.append({
+                'Time': tx_time.strftime('%Y-%m-%d %H:%M'),
+                'Type': 'Sell' if is_sell else 'Buy',
+                'Profit/Loss (%)': profit,
+                'Jeet Detected': 'Yes 🚨' if is_jeet else 'No ✅'
+            })
+    return pd.DataFrame(transactions) if transactions else pd.DataFrame()
+
+# Sidebar for inputs
+st.sidebar.header("Wallet Input")
+wallet_address = st.sidebar.text_input("Enter Solana Wallet Address (e.g., for simulation):")
+
+# Fetch and display data
+with st.spinner("Fetching crypto data..."):
+    crypto_df = fetch_crypto_data()
+
+if not crypto_df.empty:
+    st.subheader("📊 Top Crypto Jeet Risk Dashboard")
+    st.dataframe(crypto_df, use_container_width=True)
+    
+    # Chart
+    st.subheader("📈 24h Price Changes")
+    st.bar_chart(crypto_df.set_index('Coin')['24h Change (%)'])
+    
+    # Metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Coins Tracked", len(crypto_df))
+    with col2:
+        high_risk = len(crypto_df[crypto_df['Jeet Risk'] == 'High 🚨'])
+        st.metric("High Jeet Risk Coins", high_risk)
+    with col3:
+        avg_change = crypto_df['24h Change (%)'].mean()
+        st.metric("Avg 24h Change", f"{avg_change:.2f}%")
+else:
+    st.warning("No data retrieved. Check connection or try again.")
+
+# Wallet analysis
+if wallet_address:
+    st.subheader(f"💼 Wallet Analysis: {wallet_address[:8]}...")
+    wallet_df = simulate_wallet_jeets(wallet_address)
+    
+    if not wallet_df.empty:
+        st.dataframe(wallet_df, use_container_width=True)
+        
+        # Jeet count
+        jeet_count = len(wallet_df[wallet_df['Jeet Detected'] == 'Yes 🚨'])
+        st.metric("Jeets Detected in Last 10 Hours", jeet_count)
+        
+        if jeet_count > 2:
+            st.error("⚠️ High jeet activity! Consider HODLing longer.")
+        else:
+            st.success("✅ Low jeet risk. Good holding strategy!")
+    else:
+        st.info("No transactions simulated. Enter a valid address.")
+else:
+    st.info("Enter a wallet address in the sidebar to analyze.")
+
+# Footer
+st.markdown("---")
+st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. Data simulated for demo; integrate real APIs for production.")
