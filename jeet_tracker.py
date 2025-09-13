@@ -1,207 +1,99 @@
 import streamlit as st
 import requests
-import pandas as pd
+from pycoingecko import CoinGeckoAPI
+from solana.rpc.api import Client
+from solana.publickey import PublicKey
 from datetime import datetime, timedelta
+from solders.signature import Signature
 import time
-from collections import defaultdict, deque
 
-# Configuration
-DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
-RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
-SOLSCAN_BASE = "https://solscan.io/tx/"
-SAMPLE_WALLET = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"  # Replace with real wallet
-POLL_INTERVAL = 60  # seconds
-LOSS_THRESHOLD = 100  # USD for leaderboard
-HOLD_TIME_MIN = 5  # minutes for jeet detection
+# Initialize APIs
+cg = CoinGeckoAPI()
+solana_client = Client("https://api.mainnet-beta.solana.com")  # Public RPC; use QuickNode/Helius for prod
 
-# Helper Functions
-@st.cache_data(ttl=300)
-def get_dexscreener_trending_solana():
-    """Get trending Solana tokens/pairs from DexScreener."""
+@st.cache_data(ttl=3600)  # Cache for 1 hour to avoid API rate limits
+def get_top_tokens(limit=1000):
+    """Fetch top 1000 tokens by 24h volume from CoinGecko and DexScreener."""
     try:
-        url = f"{DEXSCREENER_BASE}/tokens/solana"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        pairs = resp.json().get('pairs', [])
-        # Highly jeeted: >20 sells or >10% price drop in last hour
-        highly_jeeted = [
-            p for p in pairs
-            if (p.get('txns', {}).get('h1', {}).get('sells', 0) > 20 or
-                p.get('priceChange', {}).get('h1', 0) < -10)
-        ]
-        return highly_jeeted[:50]  # Top 50 pairs (changed from 10)
-    except:
+        # CoinGecko: Top tokens by volume (proxy for 30-day activity)
+        coins = cg.get_coins_markets(vs_currency='usd', per_page=limit, page=1, order='volume_desc')
+        solana_tokens = [(coin['id'], coin['symbol'], coin.get('platforms', {}).get('solana', '')) 
+                        for coin in coins if coin.get('platforms', {}).get('solana')]
+        # DexScreener: Trending Solana pairs
+        ds_url = "https://api.dexscreener.com/latest/dex/search/?q=solana"
+        ds_response = requests.get(ds_url).json()
+        pairs = ds_response.get('pairs', [])[:500]
+        ds_tokens = [(pair['baseToken']['address'].lower(), pair['baseToken']['symbol'], 
+                     pair['baseToken']['address']) for pair in pairs]
+        # Combine and dedupe
+        top_tokens = list(set(solana_tokens + ds_tokens))[:1000]
+        return top_tokens
+    except Exception as e:
+        st.error(f"Error fetching top tokens: {e}")
         return []
 
-@st.cache_data(ttl=300)
-def get_token_price_coingecko(token_symbol, date):
-    """Get historical price from CoinGecko."""
+def is_sell_transaction(tx, address):
+    """Check if transaction is a sell (sends token, receives SOL/USDC)."""
     try:
-        cg_id = {'SOL': 'solana', 'USDC': 'usd-coin'}.get(token_symbol, 'solana')
-        url = f"{COINGECKO_BASE}/coins/{cg_id}/history?date={date.strftime('%d-%m-%Y')}"
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get('market_data', {}).get('current_price', {}).get('usd', 0)
-    except:
-        return 0.001  # Fallback for meme tokens
+        parsed_tx = solana_client.get_parsed_transaction(tx.signature, max_supported_transaction_version=0)
+        if not parsed_tx.value:
+            return False
+        pre_balances = parsed_tx.value.meta.pre_token_balances or []
+        post_balances = parsed_tx.value.meta.post_token_balances or []
+        address_str = str(address)
+        for pre, post in zip(pre_balances, post_balances):
+            if (pre.owner == address_str and post.owner == address_str and 
+                pre.ui_token_amount.amount > post.ui_token_amount.amount):
+                mint = pre.mint
+                if mint != "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":  # Exclude USDC
+                    instructions = parsed_tx.value.transaction.message.instructions
+                    for instr in instructions:
+                        if 'programId' in instr and str(instr['programId']) in [
+                            '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',  # Raydium
+                            'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4'   # Jupiter
+                        ]:
+                            return True
+        return False
+    except Exception as e:
+        st.warning(f"Error parsing transaction {tx.signature}: {e}")
+        return False
 
-def rpc_call(method, params=[]):
-    """Call Solana RPC."""
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+def count_jeets(address_str, top_tokens):
+    """Count unique tokens sold in past 7 days."""
     try:
-        resp = requests.post(RPC_ENDPOINT, json=payload, timeout=10)
-        resp.raise_for_status()
-        return resp.json().get('result')
-    except:
-        return None
-
-def get_signatures(wallet, before_sig=None, limit=100):
-    """Get transaction signatures for wallet."""
-    params = [wallet, {"limit": limit, "commitment": "confirmed"}]
-    if before_sig:
-        params[1]["before"] = before_sig
-    return rpc_call("getSignaturesForAddress", params)
-
-def get_transaction_details(sig):
-    """Get transaction details."""
-    return rpc_call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
-
-def analyze_wallet_trades(wallet, lookback_hours=24):
-    """Analyze wallet for jeets using Solana RPC."""
-    cutoff_time = datetime.now() - timedelta(hours=lookback_hours)
-    signatures = get_signatures(wallet)
-    if not signatures:
-        return []
-
-    buys = defaultdict(deque)  # token: deque(amount, time, price)
-    jeets = []
-    for sig_info in signatures:
-        timestamp = datetime.fromtimestamp(sig_info['blockTime'])
-        if timestamp < cutoff_time:
-            continue
-        tx = get_transaction_details(sig_info['signature'])
-        if not tx or 'meta' not in tx:
-            continue
-
-        pre_balances = {bal['owner']: bal for bal in tx.get('meta', {}).get('preTokenBalances', [])}
-        post_balances = {bal['owner']: bal for bal in tx.get('meta', {}).get('postTokenBalances', [])}
-
-        for account in post_balances:
-            if account != wallet:
+        address = PublicKey(address_str)
+        end_time = int(time.time())
+        start_time = int((datetime.now() - timedelta(days=7)).timestamp())
+        signatures = solana_client.get_signatures_for_address(address, limit=1000, commitment='confirmed').value
+        jeeted_tokens = set()
+        for sig in signatures:
+            if sig.block_time < start_time or sig.block_time > end_time:
                 continue
-            mint = post_balances[account].get('mint')
-            if not mint:
-                continue
-            pre_amount = float(pre_balances.get(account, {}).get('uiTokenAmount', {}).get('uiAmount', 0) or 0)
-            post_amount = float(post_balances[account].get('uiTokenAmount', {}).get('uiAmount', 0) or 0)
-            amount_change = post_amount - pre_amount
-            price = get_token_price_coingecko(mint[:8], timestamp)
+            if is_sell_transaction({'signature': sig.signature}, address):
+                parsed = solana_client.get_parsed_transaction(sig.signature, max_supported_transaction_version=0)
+                if parsed.value and parsed.value.meta.pre_token_balances:
+                    mint = parsed.value.meta.pre_token_balances[0].mint
+                    if mint in [token[2] for token in top_tokens]:
+                        jeeted_tokens.add((mint, next((t[1] for t in top_tokens if t[2] == mint), 'Unknown')))
+        return len(jeeted_tokens), list(jeeted_tokens)
+    except Exception as e:
+        st.error(f"Error processing address: {e}")
+        return 0, []
 
-            if amount_change > 0:
-                buys[mint].append((amount_change, timestamp, price))
-            elif amount_change < 0:
-                total_sold = 0
-                amount_sold = abs(amount_change)
-                sell_usd = amount_sold * price
-                while buys[mint] and total_sold < amount_sold:
-                    buy_amount, buy_time, buy_price = buys[mint][0]
-                    hold_min = (timestamp - buy_time).total_seconds() / 60
-                    amt_used = min(buy_amount, amount_sold - total_sold)
-                    buy_usd = amt_used * buy_price
-                    sell_portion = amt_used * price
-                    loss = buy_usd - sell_portion
-                    if loss > LOSS_THRESHOLD and hold_min < HOLD_TIME_MIN:
-                        jeets.append({
-                            'token': mint[:8],
-                            'hold_time_min': hold_min,
-                            'loss_usd': loss,
-                            'date': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-                            'tx_sig': sig_info['signature']
-                        })
-                    total_sold += amt_used
-                    if amt_used < buy_amount:
-                        buys[mint][0] = (buy_amount - amt_used, buy_time, buy_price)
-                    else:
-                        buys[mint].popleft()
-        time.sleep(0.1)  # Rate limit
-    return jeets
+# Streamlit UI
+st.title("Ultimate Jeet Tracker")
+st.write("Enter a Solana wallet address to scan for jeets (sells) of top 1000 tokens over the past 7 days.")
 
-# Streamlit App
-st.title("🦵 Jeet Tracker: Solana Meme Coin Sell/Loss Tracker")
-st.markdown("Track highly jeeted Solana tokens and wallet losses using DexScreener, CoinGecko, and Solana RPC. No API keys needed.")
-
-# Section 1: Recent Highly Jeeted Tokens
-st.header("Recent Highly Jeeted Tokens")
-if st.button("Refresh Recent Jeets"):
-    with st.spinner("Fetching from DexScreener..."):
-        trending = get_dexscreener_trending_solana()
-        recent_jeets = []
-        for pair in trending:
-            token = pair['baseToken']['address']
-            symbol = pair['baseToken']['symbol']
-            # Use pair creator as sample wallet; in prod, parse txns for sellers
-            wallet = pair.get('pairCreator', SAMPLE_WALLET)
-            jeets = analyze_wallet_trades(wallet, lookback_hours=1)
-            if jeets:
-                j = jeets[0]  # Take first jeet
-                recent_jeets.append({
-                    'Token': symbol,
-                    'Wallet': wallet,
-                    'Solscan Link': f"[View]({SOLSCAN_BASE}{j['tx_sig']})",
-                    'Hold Time (min)': f"{j['hold_time_min']:.2f}",
-                    'Loss (USD)': f"${j['loss_usd']:.2f}",
-                    'Date': j['date']
-                })
-        if recent_jeets:
-            st.table(pd.DataFrame(recent_jeets))
-        else:
-            st.info("No highly jeeted tokens detected recently.")
-
-# Section 2: Wallet Search
-st.header("Search Wallet for Jeets")
-wallet_input = st.text_input("Enter Solana Wallet Address", value=SAMPLE_WALLET)
-if wallet_input:
-    with st.spinner("Analyzing wallet via Solana RPC..."):
-        jeets = analyze_wallet_trades(wallet_input, lookback_hours=24)
-        if jeets:
-            df_wallet = pd.DataFrame(jeets)
-            df_wallet['Solscan Link'] = df_wallet['tx_sig'].apply(lambda x: f"[View]({SOLSCAN_BASE}{x})")
-            st.table(df_wallet[['token', 'hold_time_min', 'loss_usd', 'date', 'Solscan Link']])
-        else:
-            st.warning("No significant jeets found for this wallet in the last 24 hours.")
-
-# Section 3: Daily Jeet Leaderboard
-st.header("Daily Jeet Leaderboard (Today)")
-today = datetime.utcnow().date()
-if st.button("Update Leaderboard"):
-    with st.spinner("Fetching daily data..."):
-        all_jeets = []
-        trending = get_dexscreener_trending_solana()
-        for pair in trending[:5]:  # Sample top 5 for leaderboard to avoid overload
-            wallet = pair.get('pairCreator', SAMPLE_WALLET)
-            jeets = analyze_wallet_trades(wallet, lookback_hours=24)
-            for j in jeets:
-                if datetime.strptime(j['date'], '%Y-%m-%d %H:%M:%S').date() == today:
-                    j['wallet'] = wallet
-                    all_jeets.append(j)
-        if all_jeets:
-            df_all = pd.DataFrame(all_jeets)
-            # Fastest Jeet
-            fastest = df_all.loc[df_all['hold_time_min'].idxmin()]
-            st.subheader("🏆 Fastest Jeet Today")
-            st.write(f"Wallet: {fastest['wallet']}")
-            st.write(f"Token: {fastest['token']}, Hold: {fastest['hold_time_min']:.2f} min, "
-                     f"Loss: ${fastest['loss_usd']:.2f}, Date: {fastest['date']}")
-            # Biggest Loss
-            biggest = df_all.loc[df_all['loss_usd'].idxmax()]
-            st.subheader("💸 Biggest Loss Today")
-            st.write(f"Wallet: {biggest['wallet']}")
-            st.write(f"Token: {biggest['token']}, Hold: {biggest['hold_time_min']:.2f} min, "
-                     f"Loss: ${biggest['loss_usd']:.2f}, Date: {biggest['date']}")
-        else:
-            st.info("No jeets today yet.")
-
-st.markdown("---")
-st.caption("Data from DexScreener, CoinGecko, Solana RPC. For production, use paid RPC (Helius) and DB for scalability.")
+address = st.text_input("Solana Address (e.g., 9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM)", 
+                       placeholder="Enter a valid Solana address")
+if st.button("Scan for Jeets"):
+    if address:
+        with st.spinner("Fetching top tokens and scanning transactions..."):
+            top_tokens = get_top_tokens()
+            jeet_count, jeeted_list = count_jeets(address, top_tokens)
+            st.success(f"Jeet Count: {jeet_count}")
+            if jeeted_list:
+                st.subheader("Jeeted Tokens")
+                st.table({"Token Mint": [t[0] for t in jeeted_list], "Symbol": [t[1] for t in jeeted_list]})
+    else:
+        st.error("Please enter a valid Solana address.")
