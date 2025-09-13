@@ -1,122 +1,137 @@
-import streamlit as st
 import requests
-import pandas as pd
-from datetime import datetime, timedelta
+import json
 import time
+from datetime import datetime
+from collections import defaultdict, deque
+import pandas as pd  # For nicer output table
 
-# Page config
-st.set_page_config(page_title="Jeet Tracker", page_icon="🚀", layout="wide")
+# Configuration
+WALLET_ADDRESS = "YourSolanaWalletAddressHere"  # e.g., "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1" (example)
+RPC_ENDPOINT = "https://api.mainnet-beta.solana.com"
+COINGECKO_API = "https://api.coingecko.com/api/v3"
 
-st.title("🚨 Jeet Tracker: Track Premature Crypto Sellers!")
-st.markdown("""
-This app tracks potential 'jeets'—traders who exit early and miss gains. 
-We monitor price dips in top cryptos and simulate wallet sells. 
-Data from CoinGecko API. Input a Solana wallet to check for jeet behavior.
-""")
+def rpc_call(method, params=[]):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params
+    }
+    response = requests.post(RPC_ENDPOINT, json=payload)
+    return response.json().get('result')
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes to avoid rate limits
-def fetch_crypto_data():
-    """Fetch top 10 cryptos from CoinGecko and detect potential jeet signals (recent dips)."""
+def get_signatures(before_sig=None, limit=1000):
+    params = [WALLET_ADDRESS, {"limit": limit}]
+    if before_sig:
+        params[1]["before"] = before_sig
+    return rpc_call("getSignaturesForAddress", params)
+
+def get_transaction_details(sig):
+    return rpc_call("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+
+def get_token_price(token_symbol, date):
+    # Approximate historical price in USD. date is UNIX timestamp.
+    # For Solana tokens, use a proxy like SOL if not listed; for demo, assume common tokens like USDC/SOL.
+    # In real code, map token mint to CoinGecko ID.
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Convert to DataFrame
-        df_data = []
-        for coin, info in data.items():
-            change_24h = info.get('usd_24h_change', 0)
-            is_jeet_risk = change_24h < -5  # Simple rule: >5% dip might indicate jeets
-            df_data.append({
-                'Coin': coin.title(),
-                'Price (USD)': info.get('usd', 0),
-                '24h Change (%)': round(change_24h, 2),
-                'Jeet Risk': 'High 🚨' if is_jeet_risk else 'Low ✅'
-            })
-        
-        df = pd.DataFrame(df_data)
-        return df if not df.empty else pd.DataFrame()  # Fallback to empty DF
-    except (requests.RequestException, ValueError, KeyError) as e:
-        st.error(f"API fetch failed: {e}. Using mock data.")
-        # Mock data fallback
-        mock_df = pd.DataFrame({
-            'Coin': ['Bitcoin', 'Ethereum', 'Solana'],
-            'Price (USD)': [60000, 3000, 150],
-            '24h Change (%)': [-3.2, -7.5, -2.1],
-            'Jeet Risk': ['Low ✅', 'High 🚨', 'Low ✅']
-        })
-        return mock_df
-
-def simulate_wallet_jeets(wallet_address):
-    """Simulate jeet detection for a wallet (replace with real Solana RPC for production)."""
-    # Mock simulation: Generate fake transactions
-    transactions = []
-    if wallet_address:
-        # Simulate 5 recent txs
-        for i in range(5):
-            tx_time = datetime.now() - timedelta(hours=i*2)
-            is_sell = i % 2 == 0  # Alternate buy/sell
-            profit = -10 if is_sell else 5  # Negative for early sells
-            is_jeet = profit < -5  # Detected jeet if sold at loss/dip
-            transactions.append({
-                'Time': tx_time.strftime('%Y-%m-%d %H:%M'),
-                'Type': 'Sell' if is_sell else 'Buy',
-                'Profit/Loss (%)': profit,
-                'Jeet Detected': 'Yes 🚨' if is_jeet else 'No ✅'
-            })
-    return pd.DataFrame(transactions) if transactions else pd.DataFrame()
-
-# Sidebar for inputs
-st.sidebar.header("Wallet Input")
-wallet_address = st.sidebar.text_input("Enter Solana Wallet Address (e.g., for simulation):")
-
-# Fetch and display data
-with st.spinner("Fetching crypto data..."):
-    crypto_df = fetch_crypto_data()
-
-if not crypto_df.empty:
-    st.subheader("📊 Top Crypto Jeet Risk Dashboard")
-    st.dataframe(crypto_df, use_container_width=True)
-    
-    # Chart
-    st.subheader("📈 24h Price Changes")
-    st.bar_chart(crypto_df.set_index('Coin')['24h Change (%)'])
-    
-    # Metrics
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Coins Tracked", len(crypto_df))
-    with col2:
-        high_risk = len(crypto_df[crypto_df['Jeet Risk'] == 'High 🚨'])
-        st.metric("High Jeet Risk Coins", high_risk)
-    with col3:
-        avg_change = crypto_df['24h Change (%)'].mean()
-        st.metric("Avg 24h Change", f"{avg_change:.2f}%")
-else:
-    st.warning("No data retrieved. Check connection or try again.")
-
-# Wallet analysis
-if wallet_address:
-    st.subheader(f"💼 Wallet Analysis: {wallet_address[:8]}...")
-    wallet_df = simulate_wallet_jeets(wallet_address)
-    
-    if not wallet_df.empty:
-        st.dataframe(wallet_df, use_container_width=True)
-        
-        # Jeet count
-        jeet_count = len(wallet_df[wallet_df['Jeet Detected'] == 'Yes 🚨'])
-        st.metric("Jeets Detected in Last 10 Hours", jeet_count)
-        
-        if jeet_count > 2:
-            st.error("⚠️ High jeet activity! Consider HODLing longer.")
+        # Example for SOL; extend for other tokens
+        if token_symbol == 'SOL':
+            url = f"{COINGECKO_API}/coins/solana/history?date={date.strftime('%d-%m-%Y')}"
+        elif token_symbol == 'USDC':
+            url = f"{COINGECKO_API}/coins/usdc/history?date={date.strftime('%d-%m-%Y')}"
+        # Add more mappings as needed, e.g., for meme tokens use current price approx.
         else:
-            st.success("✅ Low jeet risk. Good holding strategy!")
-    else:
-        st.info("No transactions simulated. Enter a valid address.")
-else:
-    st.info("Enter a wallet address in the sidebar to analyze.")
+            return 0.001  # Fallback low price for unknown meme tokens
+        resp = requests.get(url)
+        data = resp.json()
+        return data.get('market_data', {}).get('current_price', {}).get('usd', 0)
+    except:
+        return 0
 
-# Footer
-st.markdown("---")
-st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. Data simulated for demo; integrate real APIs for production.")
+def analyze_wallet():
+    # Fetch all transaction signatures
+    signatures = []
+    before = None
+    while True:
+        sigs = get_signatures(before)
+        if not sigs:
+            break
+        signatures.extend(sigs)
+        before = sigs[-1]['signature']
+        time.sleep(0.1)  # Rate limit
+
+    # Parse transactions for token transfers
+    buys = defaultdict(deque)  # token_mint: deque of (amount, timestamp, usd_value)
+    sells = defaultdict(list)  # token_mint: list of (amount, timestamp, usd_value)
+    token_set = set()  # For unique tokens jeeted
+
+    for sig_info in signatures:
+        tx = get_transaction_details(sig_info['signature'])
+        if not tx or 'meta' not in tx:
+            continue
+        timestamp = datetime.fromtimestamp(sig_info['blockTime'])
+        pre_balances = {bal['owner']: bal for bal in tx.get('meta', {}).get('preTokenBalances', [])}
+        post_balances = {bal['owner']: bal for bal in tx.get('meta', {}).get('postTokenBalances', [])}
+
+        # Simplified: Check for net token outflow (sell) or inflow (buy) for the wallet
+        # In reality, use program IDs to detect swaps (e.g., Jupiter: JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4)
+        for account in post_balances:
+            if account != WALLET_ADDRESS:
+                continue
+            mint = post_balances[account].get('mint')
+            if not mint:
+                continue
+            pre_amount = float(pre_balances.get(account, {}).get('uiTokenAmount', {}).get('uiAmount', 0) or 0)
+            post_amount = float(post_balances[account].get('uiTokenAmount', {}).get('uiAmount', 0) or 0)
+            amount_change = post_amount - pre_amount
+            if amount_change > 0:
+                # Buy
+                usd_value = amount_change * get_token_price(mint[:8], timestamp)  # Approx symbol from mint
+                buys[mint].append((amount_change, timestamp, usd_value))
+            elif amount_change < 0:
+                # Sell
+                usd_value = abs(amount_change) * get_token_price(mint[:8], timestamp)
+                sells[mint].append((abs(amount_change), timestamp, usd_value))
+                token_set.add(mint)
+
+        time.sleep(0.1)  # Rate limit
+
+    # Calculate P&L for losses (FIFO matching)
+    total_usd_lost = 0
+    for mint, sell_list in sells.items():
+        buy_queue = buys[mint]
+        for sell_amount, sell_time, sell_usd in sell_list:
+            total_sold = 0
+            while buy_queue and total_sold < sell_amount:
+                buy_amount, buy_time, buy_usd_per_unit = buy_queue[0]
+                if buy_amount <= sell_amount - total_sold:
+                    # Full buy lot sold
+                    pnl = (sell_usd / sell_amount) * buy_amount - (buy_usd_per_unit * buy_amount)
+                    total_sold += buy_amount
+                    buy_queue.popleft()
+                else:
+                    # Partial
+                    fraction = (sell_amount - total_sold) / buy_amount
+                    pnl = (sell_usd / sell_amount) * (buy_amount * fraction) - (buy_usd_per_unit * buy_amount * fraction)
+                    buy_queue[0] = (buy_amount * (1 - fraction), buy_time, buy_usd_per_unit)
+                    total_sold = sell_amount
+                if pnl < 0:
+                    total_usd_lost += abs(pnl)
+
+    # Results
+    tokens_jeeted = len(token_set)
+    print(f"Tokens Jeeted (Sold): {tokens_jeeted}")
+    print(f"USD Lost (from losing sells): ${total_usd_lost:.2f}")
+
+    # For table output: Summary of sells
+    sell_data = []
+    for mint, sell_list in sells.items():
+        total_sell_usd = sum(s[2] for s in sell_list)
+        sell_data.append({'Token Mint': mint[:8], 'Sells Count': len(sell_list), 'Total Sell USD': total_sell_usd})
+    df = pd.DataFrame(sell_data)
+    print("\nSell Summary Table:")
+    print(df)
+
+# Run the analysis
+if __name__ == "__main__":
+    analyze_wallet()
