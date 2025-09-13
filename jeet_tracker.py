@@ -30,7 +30,7 @@ def get_dexscreener_trending_solana():
             if (p.get('txns', {}).get('h1', {}).get('sells', 0) > 20 or
                 p.get('priceChange', {}).get('h1', 0) < -10)
         ]
-        return highly_jeeted[:10]  # Top 10
+        return highly_jeeted[:50]  # Top 50 pairs (changed from 10)
     except:
         return []
 
@@ -161,47 +161,4 @@ if st.button("Refresh Recent Jeets"):
 
 # Section 2: Wallet Search
 st.header("Search Wallet for Jeets")
-wallet_input = st.text_input("Enter Solana Wallet Address", value=SAMPLE_WALLET)
-if wallet_input:
-    with st.spinner("Analyzing wallet via Solana RPC..."):
-        jeets = analyze_wallet_trades(wallet_input, lookback_hours=24)
-        if jeets:
-            df_wallet = pd.DataFrame(jeets)
-            df_wallet['Solscan Link'] = df_wallet['tx_sig'].apply(lambda x: f"[View]({SOLSCAN_BASE}{x})")
-            st.table(df_wallet[['token', 'hold_time_min', 'loss_usd', 'date', 'Solscan Link']])
-        else:
-            st.warning("No significant jeets found for this wallet in the last 24 hours.")
-
-# Section 3: Daily Jeet Leaderboard
-st.header("Daily Jeet Leaderboard (Today)")
-today = datetime.utcnow().date()
-if st.button("Update Leaderboard"):
-    with st.spinner("Fetching daily data..."):
-        all_jeets = []
-        trending = get_dexscreener_trending_solana()
-        for pair in trending[:5]:  # Sample top 5
-            wallet = pair.get('pairCreator', SAMPLE_WALLET)
-            jeets = analyze_wallet_trades(wallet, lookback_hours=24)
-            for j in jeets:
-                if datetime.strptime(j['date'], '%Y-%m-%d %H:%M:%S').date() == today:
-                    j['wallet'] = wallet
-                    all_jeets.append(j)
-        if all_jeets:
-            df_all = pd.DataFrame(all_jeets)
-            # Fastest Jeet
-            fastest = df_all.loc[df_all['hold_time_min'].idxmin()]
-            st.subheader("🏆 Fastest Jeet Today")
-            st.write(f"Wallet: {fastest['wallet']}")
-            st.write(f"Token: {fastest['token']}, Hold: {fastest['hold_time_min']:.2f} min, "
-                     f"Loss: ${fastest['loss_usd']:.2f}, Date: {fastest['date']}")
-            # Biggest Loss
-            biggest = df_all.loc[df_all['loss_usd'].idxmax()]
-            st.subheader("💸 Biggest Loss Today")
-            st.write(f"Wallet: {biggest['wallet']}")
-            st.write(f"Token: {biggest['token']}, Hold: {biggest['hold_time_min']:.2f} min, "
-                     f"Loss: ${biggest['loss_usd']:.2f}, Date: {biggest['date']}")
-        else:
-            st.info("No jeets today yet.")
-
-st.markdown("---")
-st.caption("Data from DexScreener, CoinGecko, Solana RPC. For production, use paid RPC (Helius) and DB for scalability.")
+wallet_input = st.text_input("Enter
