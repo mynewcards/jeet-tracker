@@ -169,3 +169,22 @@ elif st.button("🔄 Refresh & Scan"):
 
 if __name__ == "__main__":
     main()
+# Inside main(), replace the button blocks with:
+if 'last_scan' not in st.session_state:
+    st.session_state.last_scan = 0
+
+if st.button("🔄 Refresh & Scan", key="refresh_scan"):  # Unique key for disambiguation
+    current_time = time.time()
+    if current_time - st.session_state.last_scan > 60:  # 60s cooldown
+        with st.spinner("Scanning pairs..."):
+            pairs = fetch_recent_pairs(chain=chain)
+            total_new_jeets = 0
+            for pair in pairs:
+                jeets = detect_jeets_in_pair(pair)
+                update_stats(jeets)
+                total_new_jeets += len(jeets)
+                time.sleep(0.2)  # Rate limit
+            st.success(f"Scanned {len(pairs)} pairs. Found {total_new_jeets} new jeets!")
+            st.session_state.last_scan = current_time
+    else:
+        st.warning("Please wait 60 seconds before scanning again.")
