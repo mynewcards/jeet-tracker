@@ -1,190 +1,86 @@
-import time
-import random
-from requests.exceptions import RequestException
 import streamlit as st
+import plotly.express as px
 import requests
-import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from io import StringIO
 
-# Mock data store (use SQLite in production)
-if 'jeets' not in st.session_state:
-    st.session_state.jeets = []  # List of dicts: {'wallet': str, 'loss_usd': float, 'time_to_sell_min': float, 'amount_usd': float, 'timestamp': datetime}
-if 'total_jeets' not in st.session_state:
-    st.session_state.total_jeets = 0
-if 'daily_amount' not in st.session_state:
-    st.session_state.daily_amount = 0.0
-if 'avg_loss' not in st.session_state:
-    st.session_state.avg_loss = 0.0
-if 'fastest_jeet' not in st.session_state:
-    st.session_state.fastest_jeet = float('inf')
+# Initialize session state for caching and key counter
+if "cached_data" not in st.session_state:
+    st.session_state.cached_data = []
+if "counter" not in st.session_state:
+    st.session_state.counter = 0
 
-# DexScreener API base URL
-BASE_URL = "https://api.dexscreener.com/latest/dex"
-
-@st.cache_data(ttl=60)  # Cache for 1 minute to reduce API calls
-def fetch_recent_pairs(chain="solana", query="meme"):
-    url = f"{BASE_URL}/search/?q={query}&chainId={chain}"
-    max_retries = 3
-    retry_delay = 1  # Initial delay in seconds
-
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()  # Raise exception for 4xx/5xx errors
-            data = response.json()
-            return data.get('pairs', [])[:10]  # Limit to 10 recent pairs
-        except RequestException as e:
-            if response.status_code == 429:
-                wait_time = retry_delay * (2 ** attempt) + random.uniform(0, 1)  # Exponential backoff with jitter
-                st.warning(f"Rate limit hit. Retrying in {wait_time:.1f} seconds... (Attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_time)
-                if attempt == max_retries - 1:
-                    st.error(f"API error: Too Many Requests. Max retries reached. Try again later or reduce scan frequency.")
-                    return []
-            else:
-                st.error(f"API error: {e}. Check connection or API status.")
-                return []
-    return []
-
-def estimate_price_at_time(pair, timestamp):
-    # Mock historical price estimation (in real: use RPC or Coingecko API)
-    current_price = float(pair['priceUsd']) if pair['priceUsd'] else 0
-    # Assume price volatility: simple linear interpolation based on age
-    age_hours = (datetime.now() - timestamp).total_seconds() / 3600
-    return current_price * (1 + np.random.uniform(-0.1, 0.1) * age_hours / 24)  # Simulate fluctuation
-
-def detect_jeets_in_pair(pair):
-    new_jeets = []
-    if 'transactions' not in pair:  # Mock transactions if not in API response (real API has 'transactions' list)
-        # Simulate 5-10 txns based on real structure
-        for _ in range(np.random.randint(5, 11)):
-            txn = {
-                'type': np.random.choice(['buy', 'sell']),
-                'maker': f"wallet_{np.random.randint(1000, 9999)}",
-                'amount': np.random.uniform(100, 10000),  # Token amount
-                'usdValue': np.random.uniform(50, 5000),  # Approx USD
-                'timestamp': datetime.now() - timedelta(minutes=np.random.uniform(1, 1440))  # Up to 24h ago
+# Function to fetch transaction data from DexScreener API
+def fetch_jeet_data():
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[429])
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    try:
+        # Replace with your DexScreener API endpoint or token pair URL
+        url = "https://api.dexscreener.com/latest/dex/pairs/ethereum/0x123..."  # Example URL
+        response = session.get(url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        # Process data to extract transactions (adjust based on API response structure)
+        transactions = data.get("pairs", [])  # Example: list of transactions
+        # Simulate jeet detection (e.g., filter trades with negative profit)
+        jeets = [
+            {
+                "timestamp": tx.get("timestamp", datetime.now().isoformat()),
+                "wallet": tx.get("maker", "Unknown"),
+                "loss": tx.get("profit", 0) * -1 if tx.get("profit", 0) < 0 else 0
             }
-            if txn['type'] == 'sell':
-                buy_price = estimate_price_at_time(pair, txn['timestamp'] + timedelta(minutes=np.random.uniform(1, 30)))  # Assume buy shortly before
-                sell_price = float(pair['priceUsd']) if pair['priceUsd'] else buy_price * 0.9  # Assume sell at current or lower
-                buy_usd = txn['amount'] * buy_price
-                sell_usd = txn['usdValue']
-                loss = buy_usd - sell_usd
-                if loss > 10:  # Threshold for jeet
-                    time_to_sell = (txn['timestamp'] - (txn['timestamp'] - timedelta(minutes=np.random.uniform(1, 60)))).total_seconds() / 60
-                    new_jeets.append({
-                        'wallet': txn['maker'],
-                        'loss_usd': loss,
-                        'time_to_sell_min': time_to_sell,
-                        'amount_usd': sell_usd,
-                        'timestamp': txn['timestamp']
-                    })
-    else:
-        # Real logic: Parse actual transactions from API
-        for txn in pair['transactions'][-10:]:  # Last 10 txns
-            if txn.get('side') == 'sell':  # Assuming API structure
-                # Similar estimation logic...
-                pass  # Implement based on actual API fields like 'txns' with 'maker', 'amount', etc.
-    return new_jeets
+            for tx in transactions
+        ]
+        return jeets
+    except requests.exceptions.RequestException as e:
+        st.warning(f"API error: {e}. Using cached data.")
+        return st.session_state.cached_data
 
-def update_stats(new_jeets):
-    today = datetime.now().date()
-    for jeet in new_jeets:
-        st.session_state.jeets.append(jeet)
-        st.session_state.total_jeets += 1
-        if jeet['timestamp'].date() == today:
-            st.session_state.daily_amount += jeet['amount_usd']
-        st.session_state.fastest_jeet = min(st.session_state.fastest_jeet, jeet['time_to_sell_min'])
+# App title and sidebar
+st.title("Jeet Tracker")
+st.sidebar.header("Controls")
+refresh = st.sidebar.button("Refresh Data", key="sidebar_refresh_btn")
+
+# Main content with dynamic updates
+placeholder = st.empty()
+with placeholder.container():
+    # Generate unique key suffix
+    timestamp = datetime.now().strftime("%H%M%S%f")
+    st.session_state.counter += 1
+    counter = st.session_state.counter
+
+    # Fetch data
+    data = fetch_jeet_data()
+    if data:
+        st.session_state.cached_data = data
+    else:
+        data = st.session_state.cached_data
+
+    # Display metrics
+    st.write(f"Total Jeet Transactions: {len(data)}", key=f"count_{counter}_{timestamp}")
     
-    if st.session_state.jeets:
-        losses = [j['loss_usd'] for j in st.session_state.jeets]
-        st.session_state.avg_loss = np.mean(losses)
-
-def main():
-    st.set_page_config(page_title="Jeet Tracker", layout="wide")
-    st.title("🩸 Jeet Tracker Dashboard")
-    st.markdown("Scan DEX data for wallets selling at a loss (jeets!). Updated live as of Sat Sep 13 2025.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        chain = st.selectbox("Chain", ["solana", "ethereum", "bsc"])
-    with col2:
-        if st.button("🔄 Refresh & Scan"):
-            pairs = fetch_recent_pairs(chain=chain)
-            for pair in pairs:
-                jeets = detect_jeets_in_pair(pair)
-                update_stats(jeets)
-                time.sleep(0.2)  # Rate limit
-            st.success(f"Scanned {len(pairs)} pairs. Found {len(jeets)} new jeets!")
-if 'last_scan' not in st.session_state:
-    st.session_state.last_scan = 0
-if st.button("🔄 Refresh & Scan") and time.time() - st.session_state.last_scan > 60:  # 60s cooldown
-    pairs = fetch_recent_pairs(chain=chain)
-    for pair in pairs:
-        jeets = detect_jeets_in_pair(pair)
-        update_stats(jeets)
-        time.sleep(0.2)  # Respect rate limit between pairs
-    st.success(f"Scanned {len(pairs)} pairs. Found {len(jeets)} new jeets!")
-    st.session_state.last_scan = time.time()
-elif st.button("🔄 Refresh & Scan"):
-    st.warning("Please wait 60 seconds before scanning again.")
-    # Metrics Cards (mimic screenshot style)
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown("### 💀 Total Jeets Caught")
-        st.metric(label="", value=f"{int(st.session_state.total_jeets):,}")
-    with col2:
-        st.markdown("### 📉 Average Loss")
-        st.metric(label="", value=f"${st.session_state.avg_loss:.0f}")
-    with col3:
-        st.markdown("### ⚡ Fastest Jeet")
-        st.metric(label="", value=f"{st.session_state.fastest_jeet:.1f}m")
-    with col4:
-        st.markdown("### 🔥 Daily Jeeted Amount")
-        st.metric(label=f"Sat Sep 13 2025", value=f"${st.session_state.daily_amount:,.2f}")
-
-    # Recent Jeets Table
-    if st.session_state.jeets:
-        df = pd.DataFrame(st.session_state.jeets)
-        st.subheader("Recent Jeets")
-        st.dataframe(df.tail(10).sort_values('timestamp', ascending=False))
-
-        # Chart: Daily Jeets Over Time
-        st.subheader("Daily Jeets Trend")
-        df['date'] = df['timestamp'].dt.date
-        daily_counts = df.groupby('date').size()
-        fig, ax = plt.subplots()
-        daily_counts.plot(kind='bar', ax=ax)
-        st.pyplot(fig)
-
-        # Export
-        csv = df.to_csv(index=False)
-        st.download_button("Export to CSV", csv, "jeets.csv", "text/csv")
-
-if __name__ == "__main__":
-    main()
-# Inside main(), replace the button blocks with:
-if 'last_scan' not in st.session_state:
-    st.session_state.last_scan = 0
-
-if st.button("🔄 Refresh & Scan", key="refresh_scan"):  # Unique key for disambiguation
-    current_time = time.time()
-    if current_time - st.session_state.last_scan > 60:  # 60s cooldown
-        with st.spinner("Scanning pairs..."):
-            pairs = fetch_recent_pairs(chain=chain)
-            total_new_jeets = 0
-            for pair in pairs:
-                jeets = detect_jeets_in_pair(pair)
-                update_stats(jeets)
-                total_new_jeets += len(jeets)
-                time.sleep(0.2)  # Rate limit
-            st.success(f"Scanned {len(pairs)} pairs. Found {total_new_jeets} new jeets!")
-            st.session_state.last_scan = current_time
+    # Display data table
+    if data:
+        df = pd.DataFrame(data)
+        st.dataframe(df, key=f"table_{counter}_{timestamp}")
+        
+        # Plotly chart for losses over time
+        fig = px.line(
+            df,
+            x="timestamp",
+            y="loss",
+            title="Jeet Losses Over Time",
+            labels={"timestamp": "Time", "loss": "Loss (USD)"}
+        )
+        st.plotly_chart(fig, key=f"chart_{counter}_{timestamp}")
     else:
-        st.warning("Please wait 60 seconds before scanning again.")
+        st.write("No data available.", key=f"nodata_{counter}_{timestamp}")
+
+# Auto-refresh every 10 seconds (adjust to avoid 429 errors)
+if not refresh:  # Only auto-refresh if manual refresh not clicked
+    time.sleep(10)
+    st.rerun()
