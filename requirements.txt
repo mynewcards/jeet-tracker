@@ -1,5 +1,3 @@
-streamlit>=1.39.0
-plotly
-requests
-urllib3
-pandas
+streamlit>=1.28.0
+requests>=2.31.0
+pandas>=2.0.0
